@@ -396,6 +396,7 @@ use std::cfg;
 #[cfg(feature = "std")]
 use std::error;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
 use std::{cmp, fmt, mem};
 
 #[macro_use]
@@ -406,52 +407,10 @@ mod serde;
 pub mod kv;
 
 #[cfg(target_has_atomic = "ptr")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(not(target_has_atomic = "ptr"))]
-use std::cell::Cell;
-#[cfg(not(target_has_atomic = "ptr"))]
-use std::sync::atomic::Ordering;
-
-#[cfg(not(target_has_atomic = "ptr"))]
-struct AtomicUsize {
-    v: Cell<usize>,
-}
-
-#[cfg(not(target_has_atomic = "ptr"))]
-impl AtomicUsize {
-    const fn new(v: usize) -> AtomicUsize {
-        AtomicUsize { v: Cell::new(v) }
-    }
-
-    fn load(&self, _order: Ordering) -> usize {
-        self.v.get()
-    }
-
-    fn store(&self, val: usize, _order: Ordering) {
-        self.v.set(val)
-    }
-
-    #[cfg(target_has_atomic = "ptr")]
-    fn compare_exchange(
-        &self,
-        current: usize,
-        new: usize,
-        _success: Ordering,
-        _failure: Ordering,
-    ) -> Result<usize, usize> {
-        let prev = self.v.get();
-        if current == prev {
-            self.v.set(new);
-        }
-        Ok(prev)
-    }
-}
-
-// Any platform without atomics is unlikely to have multiple cores, so
-// writing via Cell will not be a race condition.
-#[cfg(not(target_has_atomic = "ptr"))]
-unsafe impl Sync for AtomicUsize {}
+use portable_atomic::AtomicUsize;
 
 // The LOGGER static holds a pointer to the global logger. It is protected by
 // the STATE static which determines whether LOGGER has been initialized yet.
@@ -1272,36 +1231,19 @@ where
 ///
 /// Note that `Trace` is the maximum level, because it provides the maximum amount of detail in the emitted logs.
 #[inline]
-#[cfg(target_has_atomic = "ptr")]
 pub fn set_max_level(level: LevelFilter) {
     MAX_LOG_LEVEL_FILTER.store(level as usize, Ordering::Relaxed);
 }
 
-/// A thread-unsafe version of [`set_max_level`].
-///
-/// This function is available on all platforms, even those that do not have
-/// support for atomics that is needed by [`set_max_level`].
-///
-/// In almost all cases, [`set_max_level`] should be preferred.
+/// Same as [`set_logger()`], kept for compatibility.
 ///
 /// # Safety
 ///
-/// This function is only safe to call when it cannot race with any other
-/// calls to `set_max_level` or `set_max_level_racy`.
-///
-/// This can be upheld by (for example) making sure that **there are no other
-/// threads**, and (on embedded) that **interrupts are disabled**.
-///
-/// It is safe to use all other logging functions while this function runs
-/// (including all logging macros).
-///
-/// [`set_max_level`]: fn.set_max_level.html
+/// Not actually unsafe anymore.
+#[deprecated = "use `set_max_level()` instead"]
 #[inline]
 pub unsafe fn set_max_level_racy(level: LevelFilter) {
-    // `MAX_LOG_LEVEL_FILTER` uses a `Cell` as the underlying primitive when a
-    // platform doesn't support `target_has_atomic = "ptr"`, so even though this looks the same
-    // as `set_max_level` it may have different safety properties.
-    MAX_LOG_LEVEL_FILTER.store(level as usize, Ordering::Relaxed);
+    set_max_level(level)
 }
 
 /// Returns the current maximum log level.
@@ -1341,7 +1283,7 @@ pub fn max_level() -> LevelFilter {
 /// An error is returned if a logger has already been set.
 ///
 /// [`set_logger`]: fn.set_logger.html
-#[cfg(all(feature = "std", target_has_atomic = "ptr"))]
+#[cfg(feature = "std")]
 pub fn set_boxed_logger(logger: Box<dyn Log>) -> Result<(), SetLoggerError> {
     set_logger_inner(|| Box::leak(logger))
 }
@@ -1354,13 +1296,6 @@ pub fn set_boxed_logger(logger: Box<dyn Log>) -> Result<(), SetLoggerError> {
 /// This function does not typically need to be called manually. Logger
 /// implementations should provide an initialization method that installs the
 /// logger internally.
-///
-/// # Availability
-///
-/// This method is available even when the `std` feature is disabled. However,
-/// it is currently unavailable on `thumbv6` targets, which lack support for
-/// some atomic operations which are used by this function. Even on those
-/// targets, [`set_logger_racy`] will be available.
 ///
 /// # Errors
 ///
@@ -1399,12 +1334,10 @@ pub fn set_boxed_logger(logger: Box<dyn Log>) -> Result<(), SetLoggerError> {
 /// ```
 ///
 /// [`set_logger_racy`]: fn.set_logger_racy.html
-#[cfg(target_has_atomic = "ptr")]
 pub fn set_logger(logger: &'static dyn Log) -> Result<(), SetLoggerError> {
     set_logger_inner(|| logger)
 }
 
-#[cfg(target_has_atomic = "ptr")]
 fn set_logger_inner<F>(make_logger: F) -> Result<(), SetLoggerError>
 where
     F: FnOnce() -> &'static dyn Log,
@@ -1432,38 +1365,14 @@ where
     }
 }
 
-/// A thread-unsafe version of [`set_logger`].
-///
-/// This function is available on all platforms, even those that do not have
-/// support for atomics that is needed by [`set_logger`].
-///
-/// In almost all cases, [`set_logger`] should be preferred.
+/// Same as [`set_logger()`], kept for compatibility.
 ///
 /// # Safety
 ///
-/// This function is only safe to call when it cannot race with any other
-/// calls to `set_logger` or `set_logger_racy`.
-///
-/// This can be upheld by (for example) making sure that **there are no other
-/// threads**, and (on embedded) that **interrupts are disabled**.
-///
-/// It is safe to use other logging functions while this function runs
-/// (including all logging macros).
-///
-/// [`set_logger`]: fn.set_logger.html
+/// Not actually unsafe anymore.
+#[deprecated = "use `set_logger()` instead"]
 pub unsafe fn set_logger_racy(logger: &'static dyn Log) -> Result<(), SetLoggerError> {
-    match STATE.load(Ordering::Acquire) {
-        UNINITIALIZED => {
-            LOGGER = logger;
-            STATE.store(INITIALIZED, Ordering::Release);
-            Ok(())
-        }
-        INITIALIZING => {
-            // This is just plain UB, since we were racing another initialization function
-            unreachable!("set_logger_racy must not be used with other initialization functions")
-        }
-        _ => Err(SetLoggerError(())),
-    }
+    set_logger(logger)
 }
 
 /// The type returned by [`set_logger`] if [`set_logger`] has already been called.
